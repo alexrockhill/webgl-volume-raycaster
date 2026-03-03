@@ -1,0 +1,15 @@
+{
+  "name": "webgl-volume-raycaster",
+  "version": "1.0.0",
+  "description": "WebGL2 volume raycaster with Babylon.js RawTexture3D integration",
+  "scripts": {
+    "test": "jest"
+  },
+  "devDependencies": {
+    "jest": "^29.0.0"
+  },
+  "jest": {
+    "testEnvironment": "node",
+    "testMatch": ["**/tests/**/*.test.js"]
+  }
+}

@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fuel Volume – Babylon.js RawTexture3D Demo</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { background: #111; color: #eee; font-family: monospace; overflow: hidden; }
+        #renderCanvas { width: 100vw; height: 100vh; display: block; touch-action: none; }
+
+        #ui {
+            position: absolute;
+            top: 12px;
+            left: 12px;
+            background: rgba(0, 0, 0, 0.75);
+            padding: 12px 16px;
+            border-radius: 6px;
+            min-width: 260px;
+            pointer-events: auto;
+        }
+        #ui h2 { font-size: 14px; margin-bottom: 8px; color: #7cf; }
+        #ui button {
+            display: inline-block;
+            margin: 4px 4px 0 0;
+            padding: 5px 10px;
+            background: #2a5a8a;
+            color: #fff;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        #ui button:hover { background: #3a7abf; }
+        #ui button:disabled { background: #444; cursor: default; }
+        #progressWrap { margin-top: 8px; display: none; }
+        #progressWrap progress { width: 100%; }
+        #status { margin-top: 8px; font-size: 12px; color: #aaa; }
+        #info { margin-top: 8px; font-size: 11px; color: #888; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <canvas id="renderCanvas"></canvas>
+    <div id="ui">
+        <h2>Fuel Volume – Babylon.js RawTexture3D</h2>
+        <button id="btnLoad">Load Fuel Volume (Dropbox)</button>
+        <button id="btnSynth">Load Synthetic Volume</button>
+        <div id="progressWrap">
+            Downloading: <progress id="progressBar" value="0" max="100"></progress>
+        </div>
+        <div id="status">Choose a data source above.</div>
+        <div id="info">
+            Orbit: left-drag &nbsp;|&nbsp; Zoom: scroll<br>
+            Volume: 64×64×64 uint8
+        </div>
+    </div>
+
+    <!-- Babylon.js core (CDN, WebGL2 capable) -->
+    <script src="https://cdn.babylonjs.com/babylon.js"></script>
+    <!-- Fuel volume loader module -->
+    <script src="js/fuel-volume-loader.js"></script>
+
+    <script>
+    'use strict';
+
+    // ─── Fuel volume URL (Dropbox direct download) ───────────────────────────
+    var FUEL_URL =
+        'https://www.dl.dropboxusercontent.com/s/7d87jcsh0qodk78/' +
+        'fuel_64x64x64_uint8.raw?dl=1';
+
+    // ─── Engine / Scene setup ─────────────────────────────────────────────────
+    var canvas  = document.getElementById('renderCanvas');
+    var engine  = new BABYLON.Engine(canvas, true, {
+        preserveDrawingBuffer: true,
+        stencil: false,
+        disableWebGL2Support: false
+    });
+    var scene   = new BABYLON.Scene(engine);
+    scene.clearColor = new BABYLON.Color4(0.06, 0.06, 0.06, 1);
+
+    // Arc-rotate camera (orbit around origin)
+    var camera = new BABYLON.ArcRotateCamera(
+        'cam', -Math.PI / 2, Math.PI / 2.5, 2.5,
+        BABYLON.Vector3.Zero(), scene
+    );
+    camera.attachControl(canvas, true);
+    camera.minZ = 0.01;
+    camera.lowerRadiusLimit = 0.5;
+    camera.upperRadiusLimit = 10;
+
+    // Subtle ambient light – volume is self-illuminated via the colormap
+    var light = new BABYLON.HemisphericLight('hemi', new BABYLON.Vector3(0,1,0), scene);
+    light.intensity = 0.05;
+
+    // ─── Custom GLSL shaders ─────────────────────────────────────────────────
+    //
+    // Strategy: the Babylon.js box mesh has vertices in [-0.5, 0.5]³.
+    // We treat object space as the raycasting space:
+    //   • box bounds  = [-0.5, 0.5]³
+    //   • tex coords  = object_pos + 0.5  →  [0,1]³
+    //   • eye_pos     = camera in object space (updated per frame via uniform)
+    //
+    // Babylon's ShaderMaterial preprocessor converts attribute/varying/gl_FragColor
+    // to the correct GLSL 3.00 es equivalents when WebGL2 is active.
+
+    BABYLON.Effect.ShadersStore['fuelVolumeVertexShader'] = [
+        'precision highp float;',
+
+        // Babylon provides these automatically
+        'attribute vec3 position;',
+        'uniform mat4 worldViewProjection;',
+
+        // Per-vertex object-space position → fragment shader
+        'varying vec3 v_pos;',
+
+        'void main() {',
+        '    v_pos = position;',
+        '    gl_Position = worldViewProjection * vec4(position, 1.0);',
+        '}'
+    ].join('\n');
+
+    BABYLON.Effect.ShadersStore['fuelVolumeFragmentShader'] = [
+        '#ifdef GL_FRAGMENT_PRECISION_HIGH',
+        'precision highp float;',
+        'precision highp sampler3D;',
+        '#else',
+        'precision mediump float;',
+        '#endif',
+
+        'uniform sampler3D volume;',
+        'uniform sampler2D colormap;',
+
+        // Camera position in object space (updated each frame)
+        'uniform vec3  eye_pos;',
+        // Volume voxel counts (for adaptive step size)
+        'uniform vec3  volume_dims;',
+        // Master sampling scale (1.0 = one sample per voxel diagonal)
+        'uniform float dt_scale;',
+
+        'varying vec3 v_pos;',
+
+        // Ray vs axis-aligned unit box [-0.5, 0.5]
+        'vec2 intersect_box(vec3 orig, vec3 dir) {',
+        '    const vec3 box_min = vec3(-0.5);',
+        '    const vec3 box_max = vec3( 0.5);',
+        '    vec3 inv = 1.0 / dir;',
+        '    vec3 t0  = (box_min - orig) * inv;',
+        '    vec3 t1  = (box_max - orig) * inv;',
+        '    vec3 lo  = min(t0, t1);',
+        '    vec3 hi  = max(t0, t1);',
+        '    return vec2(max(lo.x, max(lo.y, lo.z)),',
+        '                min(hi.x, min(hi.y, hi.z)));',
+        '}',
+
+        // Wang-hash jitter to break up banding artifacts
+        'float wang_hash(int seed) {',
+        '    seed = (seed ^ 61) ^ (seed >> 16);',
+        '    seed *= 9;',
+        '    seed = seed ^ (seed >> 4);',
+        '    seed *= 0x27d4eb2d;',
+        '    seed = seed ^ (seed >> 15);',
+        '    return float(seed % 2147483647) / 2147483647.0;',
+        '}',
+
+        'float linear_to_srgb(float x) {',
+        '    if (x <= 0.0031308) return 12.92 * x;',
+        '    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;',
+        '}',
+
+        'void main() {',
+        '    vec3 ray_dir = normalize(v_pos - eye_pos);',
+        '    vec2 t_hit   = intersect_box(eye_pos, ray_dir);',
+        '    if (t_hit.x > t_hit.y) discard;',
+        '    t_hit.x = max(t_hit.x, 0.0);',
+
+        // Adaptive step: one sample per voxel diagonal along the ray
+        '    vec3 dt_vec = 1.0 / (volume_dims * abs(ray_dir));',
+        '    float dt = dt_scale * min(dt_vec.x, min(dt_vec.y, dt_vec.z));',
+
+        // Jitter ray start to hide banding
+        '    float jitter = wang_hash(int(gl_FragCoord.x + 2048.0 * gl_FragCoord.y));',
+        '    vec3 p = eye_pos + (t_hit.x + jitter * dt) * ray_dir;',
+
+        '    vec4 color = vec4(0.0);',
+
+        '    for (float t = t_hit.x; t < t_hit.y; t += dt) {',
+        // Map object space [-0.5,0.5] → texture space [0,1]
+        '        vec3 tex = p + vec3(0.5);',
+        '        float val = texture(volume, tex).r;',
+        '        vec4  col = vec4(texture(colormap, vec2(val, 0.5)).rgb, val);',
+        // Opacity correction for step size
+        '        col.a = 1.0 - pow(1.0 - col.a, dt_scale);',
+        // Front-to-back compositing
+        '        color.rgb += (1.0 - color.a) * col.a * col.rgb;',
+        '        color.a   += (1.0 - color.a) * col.a;',
+        '        if (color.a >= 0.95) break;',
+        '        p += ray_dir * dt;',
+        '    }',
+
+        '    if (color.a < 0.001) discard;',
+
+        // sRGB gamma correction
+        '    color.r = linear_to_srgb(color.r);',
+        '    color.g = linear_to_srgb(color.g);',
+        '    color.b = linear_to_srgb(color.b);',
+
+        '    gl_FragColor = color;',
+        '}'
+    ].join('\n');
+
+    // ─── Colormap texture (plasma-like, RGBA) ────────────────────────────────
+    function buildColormapTexture() {
+        var size = 256;
+        var data = new Uint8Array(size * 4);
+        for (var i = 0; i < size; i++) {
+            var t = i / (size - 1);
+            // Clamp-safe plasma approximation
+            var r = Math.round(Math.min(255, Math.max(0, 255 * (0.5 + 0.5 * Math.sin(Math.PI * t - 0.5)))));
+            var g = Math.round(Math.min(255, Math.max(0, 255 * (0.5 + 0.5 * Math.sin(Math.PI * t + 0.5)))));
+            var b = Math.round(Math.min(255, Math.max(0, 255 * (1.0 - t))));
+            var a = Math.round(255 * Math.pow(t, 0.6));   // low values are transparent
+            data[i * 4 + 0] = r;
+            data[i * 4 + 1] = g;
+            data[i * 4 + 2] = b;
+            data[i * 4 + 3] = a;
+        }
+        return new BABYLON.RawTexture(
+            data, size, 1,
+            BABYLON.Engine.TEXTUREFORMAT_RGBA,
+            scene,
+            false, false,
+            BABYLON.Texture.BILINEAR_SAMPLINGMODE,
+            BABYLON.Engine.TEXTURETYPE_UNSIGNED_BYTE
+        );
+    }
+
+    // ─── Volume rendering setup ──────────────────────────────────────────────
+    var volumeMesh     = null;
+    var volumeMaterial = null;
+
+    function setupVolumeRendering(data, dims) {
+        // Dispose previous resources if reloading
+        if (volumeMesh)     { volumeMesh.dispose();     volumeMesh     = null; }
+        if (volumeMaterial) { volumeMaterial.dispose(); volumeMaterial = null; }
+
+        // Create 3D texture via fuel-volume-loader helper
+        var volumeTexture = createVolumeTexture(data, dims, scene, BABYLON);
+
+        // Colormap
+        var colormapTexture = buildColormapTexture();
+
+        // Shader material
+        volumeMaterial = new BABYLON.ShaderMaterial(
+            'fuelVolumeMat', scene,
+            { vertex: 'fuelVolume', fragment: 'fuelVolume' },
+            {
+                attributes: ['position'],
+                uniforms:   ['worldViewProjection', 'eye_pos', 'volume_dims', 'dt_scale'],
+                samplers:   ['volume', 'colormap'],
+            }
+        );
+
+        volumeMaterial.setTexture('volume',   volumeTexture);
+        volumeMaterial.setTexture('colormap', colormapTexture);
+        volumeMaterial.setVector3('volume_dims', new BABYLON.Vector3(dims[0], dims[1], dims[2]));
+        volumeMaterial.setFloat('dt_scale', 1.0);
+
+        // Back-face culling off: we want both box faces to rasterise so the
+        // ray-box intersection works whether the camera is inside or outside.
+        volumeMaterial.backFaceCulling = false;
+
+        // Bounding-box mesh (unit cube, vertices in [-0.5, 0.5])
+        volumeMesh = BABYLON.MeshBuilder.CreateBox('volume', { size: 1 }, scene);
+        volumeMesh.material = volumeMaterial;
+
+        // For non-cubic volumes scale the box to preserve aspect ratio
+        var maxDim = Math.max(dims[0], dims[1], dims[2]);
+        volumeMesh.scaling = new BABYLON.Vector3(
+            dims[0] / maxDim,
+            dims[1] / maxDim,
+            dims[2] / maxDim
+        );
+
+        // Update eye_pos (camera in object space) before each frame
+        scene.registerBeforeRender(function () {
+            if (!volumeMesh || !volumeMaterial) return;
+            var worldInv = BABYLON.Matrix.Invert(volumeMesh.getWorldMatrix());
+            var eyeObj   = BABYLON.Vector3.TransformCoordinates(camera.position, worldInv);
+            volumeMaterial.setVector3('eye_pos', eyeObj);
+        });
+
+        document.getElementById('status').textContent =
+            'Volume ready: ' + dims[0] + '\u00d7' + dims[1] + '\u00d7' + dims[2] +
+            ' (' + data.length.toLocaleString() + ' bytes)';
+    }
+
+    // ─── Data loaders ────────────────────────────────────────────────────────
+
+    // Load from Dropbox
+    document.getElementById('btnLoad').addEventListener('click', function () {
+        var btnLoad      = this;
+        var progressWrap = document.getElementById('progressWrap');
+        var progressBar  = document.getElementById('progressBar');
+        var status       = document.getElementById('status');
+
+        btnLoad.disabled = true;
+        progressWrap.style.display = 'block';
+        status.textContent = 'Downloading fuel volume\u2026';
+
+        loadRawVolume(FUEL_URL, function (pct) {
+            progressBar.value = pct;
+        }).then(function (result) {
+            progressWrap.style.display = 'none';
+            setupVolumeRendering(result.data, result.dims);
+        }).catch(function (err) {
+            progressWrap.style.display = 'none';
+            status.textContent = 'Error: ' + err.message +
+                '\n(CORS? Try serving locally or use the synthetic volume.)';
+            btnLoad.disabled = false;
+        });
+    });
+
+    // Generate a synthetic 64^3 volume (no network needed; useful for tests)
+    document.getElementById('btnSynth').addEventListener('click', function () {
+        var dims = [64, 64, 64];
+        var size = dims[0] * dims[1] * dims[2];
+        var data = new Uint8Array(size);
+        var cx = 32, cy = 32, cz = 32;
+        var r  = 20;
+        for (var z = 0; z < dims[2]; z++) {
+            for (var y = 0; y < dims[1]; y++) {
+                for (var x = 0; x < dims[0]; x++) {
+                    var dist  = Math.sqrt((x-cx)*(x-cx) + (y-cy)*(y-cy) + (z-cz)*(z-cz));
+                    var value = Math.max(0, 1 - dist / r);
+                    data[z * dims[0] * dims[1] + y * dims[0] + x] = Math.round(value * 255);
+                }
+            }
+        }
+        setupVolumeRendering(data, dims);
+        document.getElementById('status').textContent = 'Synthetic sphere volume loaded.';
+    });
+
+    // ─── Render loop ─────────────────────────────────────────────────────────
+    engine.runRenderLoop(function () { scene.render(); });
+    window.addEventListener('resize', function () { engine.resize(); });
+    </script>
+</body>
+</html>
