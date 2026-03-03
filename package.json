@@ -3,9 +3,11 @@
   "version": "1.0.0",
   "description": "WebGL2 volume raycaster with Babylon.js RawTexture3D integration",
   "scripts": {
+    "dev": "http-server -p 8080 -o /babylon-fuel-demo.html",
     "test": "jest"
   },
   "devDependencies": {
+    "http-server": "^14.0.0",
     "jest": "^29.0.0"
   },
   "jest": {
